@@ -1,6 +1,7 @@
 import streamlit as st
 from snowflake.snowpark.context import get_active_session
 import json
+import snowflake.connector
 
 def search_code(query: str):
     session = get_active_session()
@@ -24,6 +25,7 @@ def search_code(query: str):
 
 def main():
     st.title("Code Search RAG Assistant")
+    st.write("Testing Snowflake connection...")
     
     # GitHub URL input
     repo_url = st.text_input("Enter GitHub Repository URL")
