@@ -1,0 +1,10 @@
+.env
+app/services/__init__.py
+app/__init__.py
+app/services/__pycache__
+app/__pycache__
+app/core/__pycache__
+app/core/__pycache__
+app/core/__init__.py
+app/tests/__init__.py
+__pycache__
