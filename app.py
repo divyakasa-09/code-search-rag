@@ -75,6 +75,7 @@ async def process_repository(owner: str, repo: str):
 
 async def load_processed_repositories():
     """Load processed repositories from Snowflake."""
+    snowflake = None
     try:
         snowflake = SnowflakeSearchService()
         repos = await snowflake.get_processed_repositories()
@@ -83,6 +84,9 @@ async def load_processed_repositories():
     except Exception as e:
         logger.error(f"Error loading repositories: {str(e)}")
         return []
+    finally:
+        if snowflake:
+            snowflake.close()
 
 def main():
     st.title("Code Repository Assistant")
@@ -162,13 +166,14 @@ def main():
 
     # Generate and display assistant response
                 with st.chat_message("assistant"):
+                    snowflake = None
                     try:
                         with st.spinner("Analyzing repository code..."):
                             owner, repo = selected_repo.split('/')
                             snowflake = SnowflakeSearchService()
                 # Pass repository name to search_and_respond
                             response = asyncio.run(snowflake.search_and_respond(prompt, repo))
-                            asyncio.run(snowflake.close())   # Use await here
+                           
 
                             if response:
                                st.session_state.messages.append({"role": "assistant", "content": response})
@@ -183,10 +188,8 @@ def main():
                             st.session_state.messages.append({"role": "assistant", "content": error_msg})
                             logger.error(f"Error processing chat query: {str(e)}")
                     finally:
-                        try:
-                            asyncio.run(snowflake.close())  # Use await here
-                        except Exception as e:
-                             logger.error(f"Error closing Snowflake connection: {e}")
+                       if snowflake:
+                           snowflake.close()
     else:
         st.info("No repositories processed yet. Enter a GitHub URL above to get started!")
 

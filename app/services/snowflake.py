@@ -354,7 +354,7 @@ class SnowflakeSearchService:
             logger.info("Reconnecting to Snowflake...")
             self._connect()
 
-    async def close(self):
+    def close(self):
         """Close the Snowflake connection."""
         if self.conn:
             try:
