@@ -83,23 +83,29 @@ class SnowflakeSearchService:
                 )
                 """)
 
-                # Create Cortex Search service
+                # Create Cortex Search service with repository filtering
                 logger.info("Creating or replacing Cortex Search service...")
                 cursor.execute("""
                 CREATE OR REPLACE CORTEX SEARCH SERVICE CODE_SEARCH_SERVICE
                 ON chunk
-                ATTRIBUTES language
+                ATTRIBUTES language, file_url, repository
                 WAREHOUSE = CODE_EXPERT_WH
                 TARGET_LAG = '1 minute'
                 AS (
-                    SELECT chunk,
-                           relative_path,
-                           file_url,
-                           language
+                    SELECT 
+                        chunk,
+                        relative_path,
+                        file_url,
+                        language,
+                        CASE 
+                            WHEN file_url LIKE 'file://%' 
+                            THEN REGEXP_SUBSTR(file_url, 'file://([^/]+)', 1, 1, 'e', 1)
+                            ELSE 'unknown'
+                        END as repository
                     FROM CODE_CHUNKS_TABLE
                 )
                 """)
-            
+                
                 self.conn.commit()
                 logger.info("Database, table and search service initialized successfully")
             except Exception as e:
@@ -131,7 +137,6 @@ class SnowflakeSearchService:
         self._ensure_connection()
         with self.get_cursor() as cursor:
             try:
-                # Build filter if language is specified
                 filter_json = (
                     f', "filter": {{"@eq": {{"language": "{language}"}}}}' 
                     if language else ''
@@ -155,17 +160,22 @@ class SnowflakeSearchService:
                 logger.error(f"Error searching code: {e}")
                 raise
 
-    async def search_and_respond(self, query: str) -> str:
+    async def search_and_respond(self, query: str, repo_name: str) -> str:
         """Search code and get AI response using Cortex Search and Mistral."""
         self._ensure_connection()
         with self.get_cursor() as cursor:
             try:
                 logger.info(f"Executing search and completion for query: {query}")
                 
-                # Prepare the search query JSON
+                # Prepare the search query with repository filter
                 search_query = {
                     "query": query,
                     "columns": ["chunk", "file_url", "language"],
+                    "filter": {
+                        "@eq": {
+                            "repository": repo_name
+                        }
+                    },
                     "limit": 10
                 }
                 
@@ -180,12 +190,14 @@ class SnowflakeSearchService:
                 )
                 SELECT SNOWFLAKE.CORTEX.COMPLETE(
                     'mistral-large2',
-                    'You are analyzing code from a GitHub repository. Based on these code chunks: ' || results::STRING || 
+                    'You are analyzing code from the GitHub repository "' || %s || '". ' ||
+                    'Only discuss code and files from this specific repository. ' ||
+                    'Based on these code chunks: ' || results::STRING || 
                     ' Answer this specific question: ' || %s || 
-                    ' Be specific about the files and functionality found in the actual code.'
+                    ' Only reference files and functionality that exist in the provided code chunks.'
                 ) AS response
                 FROM search_results;
-                """, (json.dumps(search_query), query))
+                """, (json.dumps(search_query), repo_name, query))
                 
                 result = cursor.fetchone()
                 if result and result[0]:
@@ -193,7 +205,7 @@ class SnowflakeSearchService:
                     return result[0]
                 
                 logger.warning("No response generated from query")
-                return "I couldn't find enough information to answer that question. Try asking about a different aspect of the code."
+                return "I couldn't find enough information in this repository to answer that question. Please ask about something specific to this repository's code."
                 
             except Exception as e:
                 logger.error(f"Error in search_and_respond: {str(e)}")
@@ -235,6 +247,102 @@ class SnowflakeSearchService:
                 }
             except Exception as e:
                 logger.error(f"Error getting repository statistics: {e}")
+                raise
+    async def get_processed_repositories(self) -> List[Dict]:
+        """Retrieve list of all processed repositories."""
+        self._ensure_connection()
+        with self.get_cursor() as cursor:
+            try:
+            # Query distinct repositories from CODE_CHUNKS_TABLE instead of PROCESSED_REPOSITORIES
+                cursor.execute("""
+                 SELECT DISTINCT
+                REGEXP_SUBSTR(file_url, 'file://([^/]+)', 1, 1, 'e', 1) as repo_name,
+                MIN(CREATED_AT) as last_processed_at,
+                COUNT(DISTINCT RELATIVE_PATH) as total_files,
+                COUNT(*) as total_chunks
+            FROM CODE_CHUNKS_TABLE
+            WHERE file_url LIKE 'file://%'
+            GROUP BY repo_name
+            ORDER BY last_processed_at DESC
+            """)
+            
+                repositories = []
+                for row in cursor.fetchall():
+                    if row[0]:  # if repo_name exists
+                        repositories.append({
+                        'owner': 'owner',  # Default owner since we don't store it
+                        'repo_name': row[0],
+                        'last_processed_at': row[1],
+                        'total_files': row[2],
+                        'total_chunks': row[3],
+                        'status': 'active'
+                    })
+                return repositories
+            except Exception as e:
+                logger.error(f"Error retrieving processed repositories: {e}")
+                raise
+
+    async def add_or_update_repository(self, owner: str, repo_name: str, total_files: int = 0, total_chunks: int = 0):
+        """Add or update a repository in the tracking table."""
+        self._ensure_connection()
+        with self.get_cursor() as cursor:
+            try:
+                # Generate repo_id
+                repo_id = f"{owner}/{repo_name}"
+            
+                cursor.execute("""
+                MERGE INTO PROCESSED_REPOSITORIES AS target
+                USING (SELECT %s AS REPO_ID, %s AS OWNER, %s AS REPO_NAME) AS source
+            ON target.OWNER = source.OWNER AND target.REPO_NAME = source.REPO_NAME
+            WHEN MATCHED THEN
+                UPDATE SET 
+                    LAST_PROCESSED_AT = CURRENT_TIMESTAMP(),
+                    STATUS = 'active',
+                    TOTAL_FILES = %s,
+                    TOTAL_CHUNKS = %s
+            WHEN NOT MATCHED THEN
+                INSERT (REPO_ID, OWNER, REPO_NAME, TOTAL_FILES, TOTAL_CHUNKS)
+                VALUES (source.REPO_ID, source.OWNER, source.REPO_NAME, %s, %s)
+            """, (repo_id, owner, repo_name, total_files, total_chunks, total_files, total_chunks))
+            
+                logger.info(f"Successfully updated repository tracking for {repo_id}")
+            except Exception as e:
+                logger.error(f"Error updating repository tracking: {e}")
+                raise
+
+    async def check_repository_exists(self, owner: str, repo_name: str) -> bool:
+        """Check if a repository exists in the tracking table."""
+        self._ensure_connection()
+        with self.get_cursor() as cursor:
+            try:
+                cursor.execute("""
+            SELECT COUNT(*)
+            FROM PROCESSED_REPOSITORIES
+            WHERE OWNER = %s 
+            AND REPO_NAME = %s 
+            AND STATUS = 'active'
+            """, (owner, repo_name))
+            
+                count = cursor.fetchone()[0]
+                return count > 0
+            except Exception as e:
+                logger.error(f"Error checking repository existence: {e}")
+                raise
+
+    async def archive_repository(self, owner: str, repo_name: str):
+        """Archive a repository (soft delete)."""
+        self._ensure_connection()
+        with self.get_cursor() as cursor:
+            try:
+                cursor.execute("""
+            UPDATE PROCESSED_REPOSITORIES
+            SET STATUS = 'archived'
+            WHERE OWNER = %s AND REPO_NAME = %s
+            """, (owner, repo_name))
+            
+                logger.info(f"Successfully archived repository {owner}/{repo_name}")
+            except Exception as e:
+                logger.error(f"Error archiving repository: {e}")
                 raise
 
     def _ensure_connection(self):

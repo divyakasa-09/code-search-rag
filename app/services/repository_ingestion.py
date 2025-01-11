@@ -94,41 +94,68 @@ class RepositoryProcessor:
     async def ingest_repository(self, owner: str, repo: str) -> bool:
         """Process all files in a repository with improved error handling and progress tracking."""
         try:
-            # Validate repository first
+        # Validate repository first
             if not await self.github_service.validate_repository(owner, repo):
-                raise ValueError(f"Repository {owner}/{repo} does not exist or is not accessible")
+               raise ValueError(f"Repository {owner}/{repo} does not exist or is not accessible")
 
-            # Get repository tree
+        # Get repository tree
             repo_files = await self.github_service.get_repository_tree(owner, repo)
             self.total_files = len(repo_files)
             self.processed_count = 0
-            
+        
             if self.total_files == 0:
-                logger.warning("No files found in repository")
-                return False
+               logger.warning("No files found in repository")
+               return False
 
-            # Process files in batches
+        # Begin tracking the repository
+            await self.snowflake_service.add_or_update_repository(
+            owner=owner,
+            repo_name=repo,
+            total_files=self.total_files,
+            total_chunks=0  # Will update this as we process
+             )
+
+        # Process files in batches
             success_count = 0
             error_count = 0
-            
+            chunks_processed = 0
+        
             for i in range(0, len(repo_files), self.batch_size):
                 batch = repo_files[i:i + self.batch_size]
                 tasks = [self.process_file(file, repo) for file in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                
+            
                 for result in results:
                     if isinstance(result, Exception):
-                        error_count += 1
-                        continue
+                       error_count += 1
+                       continue
                     if result and result.get('status') == 'success':
-                        success_count += 1
+                       success_count += 1
+                       chunks_processed += 1  # Increment for each successful chunk
+
+            # Update repository stats periodically
+                if i % 10 == 0 or i == len(repo_files) - 1:
+                    await self.snowflake_service.add_or_update_repository(
+                    owner=owner,
+                    repo_name=repo,
+                    total_files=success_count,
+                    total_chunks=chunks_processed
+                    )
 
             logger.info(f"Repository processing completed. "
-                       f"Processed {success_count} files successfully, "
-                       f"{error_count} files failed.")
+                   f"Processed {success_count} files successfully, "
+                   f"{error_count} files failed.")
+
+        # Final update of repository stats
+            await self.snowflake_service.add_or_update_repository(
+            owner=owner,
+            repo_name=repo,
+            total_files=success_count,
+            total_chunks=chunks_processed
+            )
 
             return success_count > 0
-
+   
         except Exception as e:
             logger.error(f"Error processing repository: {e}")
             raise
