@@ -20,6 +20,8 @@ settings = get_settings()
 
 def initialize_session_state():
     """Initialize or reset session state variables."""
+    if 'loading' not in st.session_state:
+        st.session_state.loading = True
     if 'processing' not in st.session_state:
         st.session_state.processing = False
     if 'current_progress' not in st.session_state:
@@ -94,104 +96,117 @@ def main():
     # Initialize session state
     initialize_session_state()
     
+    # Initialize loading placeholder
+    loading_placeholder = st.empty()
+    
+    # Show loading indicator during initialization
+    if st.session_state.loading:
+        with loading_placeholder.container():
+            st.markdown("### Loading Code Repository Assistant")
+            st.progress(0.75, "Initializing services and loading repositories...")
+            st.info("Setting up connection to Snowflake and loading repository data...")
+        
     # Load processed repositories using asyncio.run
     try:
         repos = asyncio.run(load_processed_repositories())
         repo_options = [f"{repo['owner']}/{repo['repo_name']}" for repo in repos] if repos else []
+        # Set loading to False after repositories are loaded
+        st.session_state.loading = False
+        loading_placeholder.empty()
     except Exception as e:
         st.error(f"Error loading repositories: {str(e)}")
         repo_options = []
+        st.session_state.loading = False
+        loading_placeholder.empty()
     
-    # Create two columns for repository input
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        repo_url = st.text_input(
-            "Enter GitHub Repository URL",
-            placeholder="https://github.com/owner/repo"
-        )
-    
-    with col2:
-        if st.button("Process Repository", disabled=st.session_state.processing):
-            repo_info = parse_github_url(repo_url)
-            if repo_info:
-                owner, repo = repo_info
-                try:
-                    asyncio.run(process_repository(owner, repo))
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
-            else:
-                st.error("Invalid GitHub URL")
-
-    # Show processing progress
-    if st.session_state.processing:
-        st.info("Processing repository...")
-        progress_placeholder = st.empty()
+    # Only show the main UI when loading is complete
+    if not st.session_state.loading:
+        # Create two columns for repository input
+        col1, col2 = st.columns([2, 1])
         
-        if st.session_state.total_files > 0:
-            progress = min(st.session_state.current_progress / st.session_state.total_files, 1.0)
-            progress_placeholder.progress(progress)
-            st.text(f"Processed {st.session_state.current_progress} of {st.session_state.total_files} files")
-            if st.session_state.progress_file:
-                st.text(f"Current file: {st.session_state.progress_file}")
-
-    # Repository selection dropdown
-    if repo_options:
-        selected_repo = st.selectbox(
-            "Select a repository to chat about",
-            options=repo_options,
-            index=0 if repo_options else None
-        )
+        with col1:
+            repo_url = st.text_input(
+                "Enter GitHub Repository URL",
+                placeholder="https://github.com/owner/repo"
+            )
         
-        if selected_repo:
-            st.divider()
-            
-            # Chat interface
-            st.subheader(f"Chat about {selected_repo}")
-            
-            # Display chat messages
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-            
-            # Chat input
-           
-            # Inside main() function, in the chat response section:
-            if prompt := st.chat_input("Ask about the code"):
-            # Add user message
-                st.session_state.messages.append({"role": "user", "content": prompt})
-                with st.chat_message("user"):
-                    st.markdown(prompt)
-
-    # Generate and display assistant response
-                with st.chat_message("assistant"):
-                    snowflake = None
+        with col2:
+            if st.button("Process Repository", disabled=st.session_state.processing):
+                repo_info = parse_github_url(repo_url)
+                if repo_info:
+                    owner, repo = repo_info
                     try:
-                        with st.spinner("Analyzing repository code..."):
-                            owner, repo = selected_repo.split('/')
-                            snowflake = SnowflakeSearchService()
-                # Pass repository name to search_and_respond
-                            response = asyncio.run(snowflake.search_and_respond(prompt, repo))
-                           
-
-                            if response:
-                               st.session_state.messages.append({"role": "assistant", "content": response})
-                               st.markdown(response)
-                            else:
-                               error_msg = f"I couldn't find relevant information in the {repo} repository. Could you rephrase your question?"
-                               st.error(error_msg)
-                               st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                        asyncio.run(process_repository(owner, repo))
+                        st.rerun()
                     except Exception as e:
+                        st.error(f"Error: {str(e)}")
+                else:
+                    st.error("Invalid GitHub URL")
+
+        # Show processing progress
+        if st.session_state.processing:
+            st.info("Processing repository...")
+            progress_placeholder = st.empty()
+            
+            if st.session_state.total_files > 0:
+                progress = min(st.session_state.current_progress / st.session_state.total_files, 1.0)
+                progress_placeholder.progress(progress)
+                st.text(f"Processed {st.session_state.current_progress} of {st.session_state.total_files} files")
+                if st.session_state.progress_file:
+                    st.text(f"Current file: {st.session_state.progress_file}")
+
+        # Repository selection dropdown
+        if repo_options:
+            selected_repo = st.selectbox(
+                "Select a repository to chat about",
+                options=repo_options,
+                index=0 if repo_options else None
+            )
+            
+            if selected_repo:
+                st.divider()
+                
+                # Chat interface
+                st.subheader(f"Chat about {selected_repo}")
+                
+                # Display chat messages
+                for message in st.session_state.messages:
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["content"])
+                
+                # Chat input
+                if prompt := st.chat_input("Ask about the code"):
+                    # Add user message
+                    st.session_state.messages.append({"role": "user", "content": prompt})
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+
+                    # Generate and display assistant response
+                    with st.chat_message("assistant"):
+                        snowflake = None
+                        try:
+                            with st.spinner("Analyzing repository code..."):
+                                owner, repo = selected_repo.split('/')
+                                snowflake = SnowflakeSearchService()
+                                response = asyncio.run(snowflake.search_and_respond(prompt, repo))
+                                
+                                if response:
+                                    st.session_state.messages.append({"role": "assistant", "content": response})
+                                    st.markdown(response)
+                                else:
+                                    error_msg = f"I couldn't find relevant information in the {repo} repository. Could you rephrase your question?"
+                                    st.error(error_msg)
+                                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                        except Exception as e:
                             error_msg = "An error occurred while analyzing the code. Please try again."
                             st.error(error_msg)
                             st.session_state.messages.append({"role": "assistant", "content": error_msg})
                             logger.error(f"Error processing chat query: {str(e)}")
-                    finally:
-                       if snowflake:
-                           snowflake.close()
-    else:
-        st.info("No repositories processed yet. Enter a GitHub URL above to get started!")
+                        finally:
+                            if snowflake:
+                                snowflake.close()
+        else:
+            st.info("No repositories processed yet. Enter a GitHub URL above to get started!")
 
 if __name__ == "__main__":
     main()
