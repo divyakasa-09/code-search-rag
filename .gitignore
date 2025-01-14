@@ -8,3 +8,4 @@ app/core/__pycache__
 app/core/__init__.py
 app/tests/__init__.py
 __pycache__
+evaluations/__init__.py
