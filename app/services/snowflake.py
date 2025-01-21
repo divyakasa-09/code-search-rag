@@ -163,7 +163,7 @@ class SnowflakeSearchService:
    
 
     async def search_and_respond(self, query: str, repo_name: str) -> dict:
-        """Enhanced version returning structured results for TruLens evaluation"""
+        """Enhanced version returning structured results for  evaluation"""
         self._ensure_connection()
         with self.get_cursor() as cursor:
             try:

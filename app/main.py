@@ -118,9 +118,9 @@ def display_processing_status():
     elif st.session_state.error:
         st.error(f"Error: {st.session_state.error}")
 
-# Render the TruLens evaluation dashboard
+# Render the  evaluation dashboard
 def render_comparison_dashboard(base_rag, filtered_rag):
-    """Enhanced dashboard with more detailed TruLens metrics visualization."""
+    """Enhanced dashboard with more detailed  metrics visualization."""
     st.divider()
     st.subheader("🎯 RAG Evaluation Dashboard")
     
@@ -749,7 +749,7 @@ def main():
                 st.divider()  
 
                 # evaluation dashboard
-                if st.checkbox("Show TruLens Evaluation Summary", value=True):
+                if st.checkbox("Show  Evaluation Summary", value=True):
                     try:
                         render_comparison_dashboard(base_rag, filtered_rag)
                     except Exception as e:

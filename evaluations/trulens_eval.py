@@ -24,7 +24,7 @@ if not logger.handlers:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-logger.info("TruLens evaluation module initialized with logging")
+logger.info(" evaluation module initialized with logging")
 
 class RAGEvaluator:
     def __init__(self, snowflake_service=None):
