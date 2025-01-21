@@ -1,222 +1,387 @@
 import logging
-from typing import Optional
-from app.core.config import get_settings
+import re
+from typing import Optional, List, Dict
 import time
 import json
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
-settings = get_settings()
+
+
+logger.setLevel(logging.INFO)
+
+
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+logger.info("TruLens evaluation module initialized with logging")
 
 class RAGEvaluator:
-    """
-    Evaluates relevance of responses with Base RAG.
-    """
-
     def __init__(self, snowflake_service=None):
-        """
-        Initialize the RAGEvaluator with the provided Snowflake service.
-
-        :param snowflake_service: Instance of SnowflakeSearchService
-        """
         self.snowflake_service = snowflake_service
         self.metrics_history = {"experiments": []}
         logger.info("Initialized Base RAG Evaluator")
 
-    def update_metrics_history(self, metrics, response_text):
-        """
-        Update the metrics history with new evaluation metrics.
-        
-        :param metrics: Dictionary containing evaluation metrics
-        :param response_text: The generated response text
-        """
-        timestamp = time.time()
-        
-        # Calculate response quality metrics
-        response_length = len(response_text.split())
-        response_has_code = '```' in response_text
-        
-        metrics.update({
-            'timestamp': timestamp,
-            'response_length': response_length,
-            'contains_code': response_has_code
-        })
-        
-        self.metrics_history["experiments"].append(metrics)
-        logger.info(f"Metrics history updated: {metrics}")
-
     async def process_query(self, query: str, mode: str, repo_name: str = None) -> dict:
-        """
-        Process a query and return evaluation results with actual response.
-
-        :param query: User query to process
-        :param mode: Mode of evaluation (e.g., "baseline")
-        :param repo_name: Name of the repository being queried
-        :return: A dictionary with the response and metrics
-        """
+        """Process a query and calculate evaluation metrics."""
         try:
-            logger.debug(f"Processing query: {query} in mode: {mode}")
-
-            # Get the actual response using search_and_respond
-            response = await self.snowflake_service.search_and_respond(query, repo_name)
+            logger.info(f"Processing query in {mode} mode: {query}")
+            logger.info(f"Repository: {repo_name}")
             
-            if not response:
-                logger.warning("No response generated")
-                return {
-                    "response": "I couldn't generate a response. Please try again.",
-                    "metrics": {"context_relevance": 0, "groundedness": 0, "answer_relevance": 0}
-                }
-
-            # Calculate real metrics based on response quality
-            # This is a simplified version - you can make this more sophisticated
-            metrics = self._calculate_metrics(response, query)
+            # Get search results and response
+            result = await self.snowflake_service.search_and_respond(query, repo_name)
             
-            # Update metrics history
-            self.update_metrics_history(metrics, response)
-
+            # Extract components
+            search_results = result["search_results"]
+            response = result["response"]
+            metadata = result["metadata"]
+            
+            logger.info(f"Retrieved {len(search_results)} search results")
+            logger.info(f"Response length: {len(response.split())}")
+            
+            # Calculate metrics
+            metrics = self._calculate_metrics(response, query, search_results)
+            
+            # Add experiment metadata
+            metrics.update({
+                "mode": mode,
+                "timestamp": time.time(),
+                "query_length": len(query.split()),
+                "response_length": len(response.split()),
+                "chunks_used": len(search_results) if search_results else 0,
+                "has_code": '```' in response
+            })
+            
+            # Store metrics in history
+            self.metrics_history["experiments"].append(metrics)
+            
             return {
                 "response": response,
                 "metrics": metrics
             }
+            
         except Exception as e:
-            logger.error(f"Error processing query in RAGEvaluator: {e}")
+            logger.error(f"Error in RAGEvaluator process_query: {str(e)}", exc_info=True)
             raise
 
-    def _calculate_metrics(self, response: str, query: str) -> dict:
-        """
-        Calculate evaluation metrics based on response and query.
-        This is a placeholder implementation - you can enhance this with actual TruLens metrics.
-        """
-        # Basic metrics calculation
-        has_code = '```' in response
-        response_length = len(response.split())
-        query_terms = set(query.lower().split())
-        response_terms = set(response.lower().split())
-        term_overlap = len(query_terms.intersection(response_terms)) / len(query_terms) if query_terms else 0
-        
-        return {
-            "context_relevance": min(0.95, term_overlap + 0.5),  # Biased toward relevance but not perfect
-            "groundedness": 0.9 if has_code else 0.7,  # Higher if contains code snippets
-            "answer_relevance": min(0.95, 0.5 + response_length / 200)  # Longer responses up to a point
-        }
-
-    async def get_evaluation_summary(self) -> dict:
-        """
-        Retrieve a summary of evaluations for visualization.
-        """
+    def _calculate_chunk_relevance(self, chunk: str, query_terms: set) -> float:
         try:
-            logger.debug("Retrieving evaluation summary")
-            return self.metrics_history
+            chunk_lower = chunk.lower()
+            chunk_terms = set(chunk_lower.split())
+            
+            # Debug original input
+            logger.debug(f"Processing chunk: {chunk[:100]}...")
+            logger.debug(f"Query terms: {query_terms}")
+            
+            # 1. Query match scoring
+            term_scores = []
+            for term in query_terms:
+                if term in chunk_lower:
+                    occurrences = chunk_lower.count(term)
+                    position = chunk_lower.index(term) / len(chunk_lower)
+                    # Higher score for terms appearing early and multiple times
+                    score = min(1.0, 0.5 + (0.3 * occurrences) + (0.2 * (1 - position)))
+                    term_scores.append(score)
+                    logger.debug(f"Term '{term}' score: {score:.3f} (occurrences: {occurrences}, position: {position:.2f})")
+                else:
+                    term_scores.append(0.3)
+            
+            query_score = sum(term_scores) / len(term_scores) if term_scores else 0.3
+            logger.debug(f"Query match score: {query_score:.3f}")
+            
+            # 2. Code relevance scoring
+            code_elements = {
+                'def ': {'weight': 0.9, 'found': False},      # Functions
+                'class ': {'weight': 0.9, 'found': False},    # Classes
+                'import ': {'weight': 0.7, 'found': False},   # Imports
+                'return ': {'weight': 0.6, 'found': False},   # Returns
+                'if ': {'weight': 0.5, 'found': False},       # Conditionals
+                'for ': {'weight': 0.5, 'found': False},      # Loops
+                'try:': {'weight': 0.5, 'found': False},      # Error handling
+            }
+            
+            code_score = 0.3  # Base score
+            for element, info in code_elements.items():
+                if element in chunk_lower:
+                    code_score += info['weight'] * 0.2
+                    info['found'] = True
+                    logger.debug(f"Found code element '{element}' (+{info['weight'] * 0.2:.3f})")
+            
+            code_score = min(0.95, code_score)
+            logger.debug(f"Code relevance score: {code_score:.3f}")
+            
+            # 3. Content quality scoring
+            quality_indicators = {
+                'readme': 0.4,
+                'description': 0.4,
+                'purpose': 0.4,
+                'functionality': 0.4,
+                'features': 0.4
+            }
+            
+            quality_score = 0.3  # Base score
+            for term, weight in quality_indicators.items():
+                if term in chunk_lower:
+                    quality_score += weight * 0.2
+                    logger.debug(f"Found quality term '{term}' (+{weight * 0.2:.3f})")
+            
+            quality_score = min(0.95, quality_score)
+            logger.debug(f"Content quality score: {quality_score:.3f}")
+            
+            # Combined scoring with weights
+            final_score = (
+                query_score * 0.4 +      # Query match importance
+                code_score * 0.4 +       # Code content importance
+                quality_score * 0.2      # General content quality
+            )
+            
+            # Apply length bonus
+            if len(chunk_terms) > 50:
+                final_score *= 1.15
+                logger.debug("Applied length bonus (15%)")
+            
+            final_score = max(0.3, min(0.95, final_score))
+            logger.debug(f"Final relevance score: {final_score:.3f}")
+            
+            return final_score
+            
         except Exception as e:
-            logger.error(f"Error retrieving evaluation summary: {e}")
-            raise
+            logger.error(f"Error calculating chunk relevance: {e}", exc_info=True)
+            return 0.3
 
+
+
+    def _calculate_response_metrics(self, response: str) -> Dict:
+        """Calculate various response-related metrics."""
+        try:
+            # Code presence metrics
+            code_blocks = response.count('```')
+            code_references = len(re.findall(r'function|method|class|variable|parameter|module|import|return', response.lower()))
+            
+            # Explanation metrics
+            has_explanation = bool(re.search(r'because|therefore|this means|in other words|specifically|for example', response.lower()))
+            
+            # Technical content metrics
+            technical_terms = len(re.findall(r'function|class|method|parameter|variable|return|import', response.lower()))
+            
+            return {
+                'code_blocks': code_blocks,
+                'code_references': code_references,
+                'has_explanation': has_explanation,
+                'technical_terms': technical_terms
+            }
+        except Exception as e:
+            logger.error(f"Error calculating response metrics: {e}")
+            return {}
+
+    def _calculate_metrics(self, response: str, query: str, code_chunks: List[str]) -> dict:
+        """Calculate comprehensive metrics for RAG evaluation."""
+        try:
+            logger.info(f"Calculating metrics for query: {query}")
+            logger.info(f"Processing {len(code_chunks)} chunks")
+        
+        # Process chunks
+            processed_chunks = []
+            for chunk in code_chunks:
+                if isinstance(chunk, dict):
+                    chunk_content = chunk.get('chunk', '')
+                else:
+                    chunk_content = str(chunk)
+                if chunk_content and chunk_content.strip():
+                    processed_chunks.append(chunk_content)
+                    logger.debug(f"Processing chunk: {chunk_content[:100]}...")
+        
+        # Query analysis
+            query_terms = set(query.lower().split())
+            query_length = len(query_terms)
+        
+        # Calculate chunk relevance scores with weight for top scores
+            chunk_relevance_scores = []
+            for chunk in processed_chunks:
+                relevance_score = self._calculate_chunk_relevance(chunk, query_terms)
+                if relevance_score > 0:
+                    chunk_relevance_scores.append(relevance_score)
+        
+        # Sort scores and give more weight to top chunks
+            if chunk_relevance_scores:
+                sorted_scores = sorted(chunk_relevance_scores, reverse=True)
+                top_k = min(5, len(sorted_scores))  # Consider top 5 chunks
+                context_relevance = sum(sorted_scores[:top_k]) / top_k
+            else:
+                context_relevance = 0.3  # Increased minimum
+        
+        # Calculate response metrics
+            response_metrics = self._calculate_response_metrics(response)
+        
+        # Enhanced groundedness calculation
+            groundedness = min(1.0, (
+            (response_metrics['code_blocks'] * 0.3) +
+            (min(1.0, response_metrics['code_references'] / 4) * 0.5) +
+            (0.2 if response_metrics['has_explanation'] else 0) +
+            (min(1.0, response_metrics['technical_terms'] / 5) * 0.2)  # Added technical terms impact
+            ))
+        
+        # Enhanced answer relevance
+            response_terms = set(response.lower().split())
+            term_overlap = len(query_terms.intersection(response_terms)) / len(query_terms) if query_terms else 0
+        
+            structure_score = (
+            (bool(response_metrics['code_blocks']) * 0.3) +
+            (response_metrics['has_explanation'] * 0.3) +
+            (min(1.0, response_metrics['technical_terms'] / 4) * 0.2) +
+            (min(1.0, len(response.split()) / 100) * 0.2)
+        )
+        
+            answer_relevance = (term_overlap * 0.6) + (structure_score * 0.4)
+        
+        # Calculate final metrics with improved minimum thresholds
+            metrics = {
+            "context_relevance": max(0.3, min(0.95, context_relevance)),
+            "groundedness": max(0.3, min(0.95, groundedness)),
+            "answer_relevance": max(0.3, min(0.95, answer_relevance)),
+            "response_quality": max(0.3, min(0.95, (context_relevance + groundedness + answer_relevance) / 3)),
+            "query_length": query_length,
+            "debug_info": {
+                "response_metrics": response_metrics,
+                "num_chunks_processed": len(processed_chunks),
+                "avg_chunk_relevance": sum(chunk_relevance_scores) / len(chunk_relevance_scores) if chunk_relevance_scores else 0,
+                "top_chunk_scores": sorted(chunk_relevance_scores, reverse=True)[:5] if chunk_relevance_scores else []
+            }
+        }
+        
+            logger.info(f"Final metrics calculated: {json.dumps(metrics, indent=2)}")
+            return metrics
+        
+        except Exception as e:
+            logger.error(f"Error calculating metrics: {e}", exc_info=True)
+            return {
+            "context_relevance": 0.3,
+            "groundedness": 0.3,
+            "answer_relevance": 0.3,
+            "response_quality": 0.3,
+            "query_length": len(query.split()) if query else 0,
+            "error": str(e)
+        }
+            
 class FilteredRAGEvaluator(RAGEvaluator):
-    """
-    Evaluates relevance of responses with Filtered RAG.
-    """
-
-    def __init__(self, snowflake_service=None, quality_threshold: Optional[float] = 0.6):
-        """
-        Initialize the FilteredRAGEvaluator with additional filtering criteria.
-        """
+    def __init__(self, snowflake_service=None, quality_threshold: float = 0.33):  # Changed from 0.1 to 0.4
         super().__init__(snowflake_service)
         self.quality_threshold = quality_threshold
         logger.info(f"Initialized Filtered RAG Evaluator with threshold {quality_threshold}")
 
     async def process_query(self, query: str, mode: str, repo_name: str = None) -> dict:
-        """
-        Process a query with additional filtering logic and return evaluation results.
-        """
         try:
-            logger.debug(f"Processing query: {query} in mode: {mode} with filtering")
-
-            # First get search results
-            search_results = await self.snowflake_service.search_code(query)
-            
-            if not search_results:
-                logger.warning("No search results found")
-                return {
-                    "response": "No relevant code found for your query.",
-                    "metrics": {"context_relevance": 0, "groundedness": 0, "answer_relevance": 0}
-                }
-
-            # Calculate relevance scores for results
-            filtered_results = []
-            for result in search_results:
-                if not isinstance(result, dict):
-                    continue
-                    
-                # Calculate relevance score based on multiple factors
-                score = self._calculate_relevance_score(result, query)
-                
-                if score >= self.quality_threshold:
-                    result['calculated_score'] = score
-                    filtered_results.append(result)
-
-            if not filtered_results:
-                logger.warning("No results met the quality threshold")
-                # Fall back to base RAG if no results meet threshold
-                return await super().process_query(query, mode, repo_name)
-
-            # Get response using filtered results
-            response = await self.snowflake_service.search_and_respond(query, repo_name)
-            
-            # Calculate metrics with higher standards for filtered results
-            metrics = self._calculate_filtered_metrics(response, query)
-            
-            # Update metrics history
-            self.update_metrics_history(metrics, response)
-
+            enhanced_query = f"""Please analyze the following query about the code:
+Question: {query}
+Additional instructions:
+- Show relevant code snippets using markdown
+- Explain any technical concepts used
+- Reference specific file paths when relevant
+- include any relevant code snippets
+- Focus on the implementation details"""
+            # Simply use the search_and_respond from snowflake service
+            result = await self.snowflake_service.search_and_respond(enhanced_query, repo_name)
+        
+            # Extract the response and calculate metrics
+            response = result["response"]
+            search_results = result["search_results"]
+        
+        # Calculate metrics
+            metrics = self._calculate_metrics(response, query, search_results)
+            metrics.update({
+            "mode": mode,
+            "timestamp": int(time.time())
+        })
+        
+        # Store metrics in history
+            self.metrics_history["experiments"].append(metrics)
+        
             return {
-                "response": response,
-                "metrics": metrics
-            }
+             "response": response,
+            "metrics": metrics
+        }
+
         except Exception as e:
-            logger.error(f"Error processing query in FilteredRAGEvaluator: {e}")
+            logger.error(f"Error in FilteredRAGEvaluator: {str(e)}")
+            raise
+    def _calculate_code_quality(self, chunk: str, query: str) -> float:
+        """Calculate code quality with a combination of structure and relevance scoring."""
+        try:
+            base_score = 0.1  # Base score for any chunk
+
+            # Define patterns for code quality scoring
+            code_patterns = {
+                'function_def': (r'def\s+\w+\s*\(', 0.3),
+                'class_def': (r'class\s+\w+', 0.3),
+                'docstring': (r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'', 0.2),
+                'comments': (r'#.*$|//.*$', 0.1),
+                'imports': (r'import\s+\w+|from\s+\w+\s+import', 0.1),
+                'variables': (r'=\s*[\w\'"[]', 0.1),
+                'code_structure': (r'if|else|for|while|try|except|return', 0.2)
+            }
+
+            # Calculate pattern-based score
+            pattern_score = base_score
+            for pattern, weight in code_patterns.values():
+                matches = len(re.findall(pattern, chunk, re.MULTILINE))
+                if matches > 0:
+                    pattern_score += min(weight, matches * weight * 0.2)
+
+            # Calculate query relevance
+            query_terms = set(query.lower().split())
+            chunk_terms = set(chunk.lower().split())
+            term_overlap = len(query_terms.intersection(chunk_terms)) / len(query_terms) if query_terms else base_score
+
+            # Combine scores with adjusted weights
+            final_score = max(base_score, min(1.0, (pattern_score * 0.4) + (term_overlap * 0.6)))
+
+            logger.debug(f"Quality scoring - Pattern: {pattern_score:.3f}, Terms: {term_overlap:.3f}, Final: {final_score:.3f}")
+            return final_score
+
+        except Exception as e:
+            logger.error(f"Error calculating code quality: {e}")
+            return base_score
+
+    def _calculate_metrics(self, response: str, query: str, code_chunks: List[str]) -> dict:
+        """Calculate metrics for the response."""
+        try:
+            # Calculate response length and check for code presence
+            response_length = len(re.sub(r'```[\s\S]*?```', '', response).split()) + \
+                              sum(len(block.split()) for block in re.findall(r'```[\s\S]*?```', response))
+            has_code = bool(re.search(r'```[\s\S]*?```', response))
+
+            # Call parent method to calculate base metrics
+            base_metrics = super()._calculate_metrics(response, query, code_chunks)
+
+            # Update and return metrics
+            base_metrics.update({
+                "response_length": response_length,
+                "has_code": has_code
+            })
+
+            logger.info(f"Final Metrics: {json.dumps(base_metrics, indent=2)}")
+            return base_metrics
+
+        except Exception as e:
+            logger.error(f"Error calculating metrics: {e}")
             raise
 
-    def _calculate_relevance_score(self, result: dict, query: str) -> float:
-        """
-        Calculate a relevance score for a search result based on multiple factors.
-        """
-        chunk = result.get('chunk', '')
-        if not chunk:
-            return 0.0
-            
-        # Normalize text
-        chunk_lower = chunk.lower()
-        query_lower = query.lower()
-        query_terms = set(query_lower.split())
-        
-        # Calculate various relevance factors
-        term_match_ratio = sum(1 for term in query_terms if term in chunk_lower) / len(query_terms)
-        
-        # Check for code presence
-        code_presence = 1.0 if any(marker in chunk for marker in ['def ', 'class ', '```', 'import ']) else 0.5
-        
-        # Check content length (prefer medium-length chunks)
-        chunk_words = len(chunk.split())
-        length_score = min(1.0, chunk_words / 500) if chunk_words <= 1000 else max(0.5, 2000 / chunk_words)
-        
-        # Combine factors with weights
-        final_score = (
-            term_match_ratio * 0.5 +
-            code_presence * 0.3 +
-            length_score * 0.2
-        )
-        
-        return final_score
-
-    def _calculate_filtered_metrics(self, response: str, query: str) -> dict:
-        """
-        Calculate metrics with higher standards for filtered results.
-        """
-        base_metrics = super()._calculate_metrics(response, query)
-        
-        # For filtered results, we adjust metrics based on the filtering process
-        filtered_boost = 0.05  # Small boost for filtered results
-        
-        return {
-            "context_relevance": min(0.98, base_metrics["context_relevance"] + filtered_boost),
-            "groundedness": min(0.98, base_metrics["groundedness"] + filtered_boost),
-            "answer_relevance": min(0.98, base_metrics["answer_relevance"] + filtered_boost)
-        }
+    def set_quality_threshold(self, threshold: float):
+        """Update the quality threshold with validation."""
+        try:
+            new_threshold = max(0.0, min(1.0, threshold))
+            old_threshold = self.quality_threshold
+            self.quality_threshold = new_threshold
+            logger.info(f"Updated quality threshold from {old_threshold:.2f} to {new_threshold:.2f}")
+        except Exception as e:
+            logger.error(f"Error updating quality threshold: {e}")

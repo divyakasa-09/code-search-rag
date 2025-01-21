@@ -4,7 +4,7 @@ import logging
 from typing import Dict, Optional, List
 from contextlib import contextmanager
 from app.core.config import get_settings
-
+from datetime import datetime
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
@@ -160,56 +160,71 @@ class SnowflakeSearchService:
                 logger.error(f"Error searching code: {e}")
                 raise
 
-    async def search_and_respond(self, query: str, repo_name: str) -> str:
-        """Search code and get AI response using Cortex Search and Mistral."""
+   
+
+    async def search_and_respond(self, query: str, repo_name: str) -> dict:
+        """Enhanced version returning structured results for TruLens evaluation"""
         self._ensure_connection()
         with self.get_cursor() as cursor:
             try:
                 logger.info(f"Executing search and completion for query: {query}")
-                
-                # Prepare the search query with repository filter
+            
                 search_query = {
-                    "query": query,
-                    "columns": ["chunk", "file_url", "language"],
-                    "filter": {
-                        "@eq": {
-                            "repository": repo_name
-                        }
-                    },
-                    "limit": 10
-                }
-                
+                "query": query,
+                "columns": ["chunk", "file_url", "language"],
+                "filter": {
+                    "@eq": {
+                        "repository": repo_name
+                    }
+                },
+                "limit": 10
+            }
+            
+            # Get search results first
                 cursor.execute("""
-                WITH search_results AS (
-                    SELECT PARSE_JSON(
-                        SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
-                            'CODE_SEARCH_SERVICE',
-                            %s
-                        )
-                    )['results'] as results
-                )
+                SELECT PARSE_JSON(
+                    SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+                        'CODE_SEARCH_SERVICE',
+                        %s
+                    )
+                )['results'] as results
+            """, (json.dumps(search_query),))
+            
+                search_results = cursor.fetchone()[0]
+            
+            # Then get completion
+                completion_prompt = (
+                f'You are analyzing code from the GitHub repository "{repo_name}". '
+                'Only discuss code and files from this specific repository. '
+                f'Based on these code chunks: {json.dumps(search_results)} '
+                f'Answer this specific question: {query} '
+                'Only reference files and functionality that exist in the provided code chunks.'
+            )
+            
+                cursor.execute("""
                 SELECT SNOWFLAKE.CORTEX.COMPLETE(
                     'mistral-large2',
-                    'You are analyzing code from the GitHub repository "' || %s || '". ' ||
-                    'Only discuss code and files from this specific repository. ' ||
-                    'Based on these code chunks: ' || results::STRING || 
-                    ' Answer this specific question: ' || %s || 
-                    ' Only reference files and functionality that exist in the provided code chunks.'
+                    %s
                 ) AS response
-                FROM search_results;
-                """, (json.dumps(search_query), repo_name, query))
-                
-                result = cursor.fetchone()
-                if result and result[0]:
-                    logger.info("Successfully generated response")
-                    return result[0]
-                
-                logger.warning("No response generated from query")
-                return "I couldn't find enough information in this repository to answer that question. Please ask about something specific to this repository's code."
-                
+            """, (completion_prompt,))
+            
+                response = cursor.fetchone()[0]
+            
+                return {
+                "search_results": search_results,
+                "response": response,
+                "metadata": {
+                    "repo_name": repo_name,
+                    "query": query,
+                    "timestamp": datetime.now().isoformat(),
+                    "model": "mistral-large2",
+                    "num_chunks": len(search_results) if search_results else 0
+                   }
+                }
+            
             except Exception as e:
                 logger.error(f"Error in search_and_respond: {str(e)}")
-                raise RuntimeError("An error occurred while processing your query. Please try again.")
+                raise
             
     async def get_repository_statistics(self, repo_name: str) -> Dict:
         """Get statistics for a repository."""
@@ -353,6 +368,14 @@ class SnowflakeSearchService:
         except Exception:
             logger.info("Reconnecting to Snowflake...")
             self._connect()
+    def is_connected(self) -> bool:
+        """Check if the connection to Snowflake is active and valid."""
+        try:
+            with self.get_cursor() as cursor:
+                cursor.execute("SELECT 1")
+                return True
+        except Exception:
+            return False
 
     def close(self):
         """Close the Snowflake connection."""

@@ -1,5 +1,7 @@
 # app/services/repository_ingestion.py
 import asyncio
+import os
+
 import logging
 from typing import List, Dict, Optional, Callable
 import base64
@@ -22,23 +24,128 @@ class RepositoryProcessor:
         self.total_files = 0
         self.processed_count = 0
         self.current_file = ""
-
+        self.skip_extensions = {
+            '.exe', '.bin', '.zip', '.tar.gz', '.jpg', '.png', 
+            '.pdf', '.doc', '.env', '.lock', '.DS_Store'  # Added .DS_Store
+        }
+        self.skip_dirs = {
+            'node_modules', 'venv', '.git', '__pycache__', 
+            'build', 'dist', 'coverage'
+        }
+        self.skip_files = {
+    'package.json',  # JavaScript/Node.js metadata
+    'yarn.lock', 'package-lock.json',  # Dependency lock files
+    'Pipfile', 'Pipfile.lock',  # Python dependency files
+    'Gemfile', 'Gemfile.lock',  # Ruby dependency files
+    'Cargo.toml', 'Cargo.lock',  # Rust dependency files
+    'composer.json', 'composer.lock',  # PHP dependency files
+    '.env.example',  # Environment example files
+    'Makefile',  # Build system files
+}
     def set_callback(self, callback: Callable[[int, int, str], None]):
         """Set a callback function to report progress."""
         self.callback = callback
 
+    def should_process_file(self, file_path: str) -> bool:
+        """Determine if a file should be processed based on size and type."""
+        if not file_path:
+            return False
+
+    
+    # Extract extension and directory path
+        file_ext = os.path.splitext(file_path)[1].lower()
+        dir_path = os.path.dirname(file_path)
+        file_name = os.path.basename(file_path)
+        
+        if not file_ext:
+            logger.info(f"Skipping file without extension: {file_path}")
+            return False
+        
+    # Log processing decision
+        should_process = (
+        file_ext not in self.skip_extensions and
+        file_name not in self.skip_files and
+        not any(skip_dir in dir_path.split('/') for skip_dir in self.skip_dirs)
+         )
+        logger.info(f"File {file_path} - Should Process: {should_process}")
+        return should_process
+    
     async def _update_progress(self, file_path: str):
         """Update processing progress."""
         self.processed_count += 1
         self.current_file = file_path
         if self.callback:
             await self.callback(self.processed_count, self.total_files, self.current_file)
+    
+    def _split_into_chunks(self, content: str, file_path: str) -> List[str]:
+        """Split content into meaningful chunks while preserving context."""
+         # Normalize line endings
+        content = content.replace('\r\n', '\n')
+        lines = content.split('\n')
+        chunks = []
+        current_chunk = []
+        current_size = 0
+    
+    # Define chunk boundaries
+        chunk_markers = {
+        'class ': {'weight': 1.0, 'starts_chunk': True},
+       
+    }
+    
+        def should_start_new_chunk(line: str, current_chunk: List[str]) -> bool:
+        # Start new chunk if:
+        # 1. Current chunk would exceed size limit (2000 chars)
+        # 2. We hit a major code marker (class/function definition)
+        # 3. We have 2+ consecutive empty lines and current chunk isn't empty
+            if current_size > 4000:
+                return True
+            
+            for marker, info in chunk_markers.items():
+                if marker in line and info['starts_chunk'] and current_chunk:
+                    return True
+                
+            if (line.strip() == '' and current_chunk and 
+                current_chunk[-1].strip() == '' and
+                len(current_chunk) > 1 and 
+                current_chunk[-2].strip() == ''):
+                return True
+            
+            return False
 
+    # Process lines
+        for line in lines:
+            if should_start_new_chunk(line, current_chunk):
+                chunk_content = '\n'.join(current_chunk).strip()
+                if chunk_content and len(chunk_content) >= 50:  # Minimum chunk size
+                # Add file context and surrounding lines
+                    final_chunk = f"File: {file_path}\n\n{chunk_content}"
+                    chunks.append(final_chunk)
+                current_chunk = []
+                current_size = 0
+            
+            current_chunk.append(line)
+            current_size += len(line) + 1
+    
+    # Don't forget last chunk
+        if current_chunk:
+            chunk_content = '\n'.join(current_chunk).strip()
+            if chunk_content and len(chunk_content) >= 50:
+                final_chunk = f"File: {file_path}\n\n{chunk_content}"
+                chunks.append(final_chunk)
+    
+        return chunks
+  
+    
     async def process_file(self, file_info: Dict, repo: str) -> Optional[Dict]:
         """Process a single file with improved error handling."""
         file_path = file_info['path']
         file_url = file_info['url']
+        logger.info(f"Starting processing for file: {file_path}")
 
+        if not self.should_process_file(file_path):
+            logger.info(f"Skipping excluded file: {file_path}")
+            return None
+        
         if file_path in self.processed_files:
             logger.info(f"Skipping already processed file: {file_path}")
             return None
@@ -62,33 +169,33 @@ class RepositoryProcessor:
 
             # Get file extension for language detection
             extension = file_path.split('.')[-1].lower() if '.' in file_path else ''
-            if not extension:
-                logger.info(f"Skipping file without extension: {file_path}")
-                return None
-
-            # Store in Snowflake
-            await self.snowflake_service.store_code_chunk(
+            chunks = self._split_into_chunks(decoded_content, file_path)
+            logger.info(f"Processing {len(chunks)} chunks for {file_path}")
+            for chunk in chunks:
+                await self.snowflake_service.store_code_chunk(
                 repo_name=repo,
                 file_path=file_path,
-                content=decoded_content,
+                content=chunk,
                 language=extension
             )
-
             self.processed_files.add(file_path)
             await self._update_progress(file_path)
-            
+
+           
+
             return {
-                "file_path": file_path,
-                "language": extension,
-                "status": "success"
-            }
+            "file_path": file_path,
+            "language": extension,
+            "num_chunks": len(chunks),
+             "status": "success"
+             }
 
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}")
             return {
-                "file_path": file_path,
-                "status": "error",
-                "error": str(e)
+            "file_path": file_path,
+            "status": "error",
+            "error": str(e)
             }
 
     async def ingest_repository(self, owner: str, repo: str) -> bool:
@@ -165,7 +272,9 @@ class RepositoryProcessor:
     async def cleanup(self):
         """Clean up resources."""
         try:
-            await self.github_service.close()
-            await self.snowflake_service.close()
+            if hasattr(self, 'github_service') and self.github_service:
+                await self.github_service.close()
+            if hasattr(self, 'snowflake_service') and self.snowflake_service:   
+                self.snowflake_service.close()  # Note: This is synchronous
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
